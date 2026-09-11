@@ -39,8 +39,8 @@ func main() {
 	job := Job{
 		ID:             uuid.NewString(),
 		IdempotencyKey: uuid.NewString(),
-		Type:           "example_job",
-		Payload:        "fresh job for docker test",
+		Type:           "slow_job",
+		Payload:        "chaos test job",
 		CreatedAt:      time.Now(),
 	}
 

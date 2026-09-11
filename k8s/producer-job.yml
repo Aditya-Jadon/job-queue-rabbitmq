@@ -1,0 +1,14 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: producer-job
+  namespace: job-queue
+spec:
+  template:
+    spec:
+      containers:
+        - name: producer
+          image: job-queue-producer:latest
+          imagePullPolicy: Never
+      restartPolicy: Never
+  backoffLimit: 2

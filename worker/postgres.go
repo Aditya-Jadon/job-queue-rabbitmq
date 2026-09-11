@@ -51,3 +51,20 @@ func isDuplicateKeyError(err error) bool {
 	}
 	return false
 }
+
+func isAlreadyProcessed(ctx context.Context, key string) (bool, error) {
+	var exists bool
+	err := db.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM processed_jobs WHERE idempotency_key = $1)",
+		key,
+	).Scan(&exists)
+	return exists, err
+}
+
+func recordCompletion(ctx context.Context, key string, jobID string) error {
+	_, err := db.Exec(ctx,
+		"INSERT INTO processed_jobs (idempotency_key, job_id) VALUES ($1, $2) ON CONFLICT (idempotency_key) DO NOTHING",
+		key, jobID,
+	)
+	return err
+}
