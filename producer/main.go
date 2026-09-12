@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,9 +14,9 @@ import (
 )
 
 func main() {
-	conn, err := connectRabbitMQ("amqp://guest:guest@rabbitmq:5672/", 10)
+	conn, err := amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
 	if err != nil {
-		log.Fatalf("%v", err)
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 	defer conn.Close()
 
@@ -24,50 +26,49 @@ func main() {
 	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"jobs", // queue name
-		true,   // durable
-		false,  // auto-delete
-		false,  // exclusive
-		false,  // no-wait
-		nil,    // arguments
-	)
+	q, err := ch.QueueDeclare("jobs", true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("Failed to declare queue: %v", err)
 	}
 
-	job := Job{
-		ID:             uuid.NewString(),
-		IdempotencyKey: uuid.NewString(),
-		Type:           "slow_job",
-		Payload:        "chaos test job",
-		CreatedAt:      time.Now(),
+	count := 200
+	if v := os.Getenv("JOB_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			count = n
+		}
 	}
 
-	body, err := json.Marshal(job)
-	if err != nil {
-		log.Fatalf("Failed to marshal job: %v", err)
-	}
+	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	for i := 0; i < count; i++ {
+		job := Job{
+			ID:             uuid.NewString(),
+			IdempotencyKey: uuid.NewString(),
+			Type:           "example_job",
+			Payload:        fmt.Sprintf("load test job #%d", i),
+			CreatedAt:      time.Now(),
+		}
 
-	err = ch.PublishWithContext(ctx,
-		"",     // exchange (default/empty routes by queue name directly)
-		q.Name, // routing key = queue name, since we're using the default exchange
-		false,  // mandatory
-		false,  // immediate
-		amqp.Publishing{
+		body, err := json.Marshal(job)
+		if err != nil {
+			log.Printf("Failed to marshal job %d: %v", i, err)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = ch.PublishWithContext(ctx, "", q.Name, false, false, amqp.Publishing{
 			ContentType:  "application/json",
 			Body:         body,
 			DeliveryMode: amqp.Persistent,
-		},
-	)
-	if err != nil {
-		log.Fatalf("Failed to publish job: %v", err)
+		})
+		cancel()
+		if err != nil {
+			log.Printf("Failed to publish job %d: %v", i, err)
+		}
 	}
 
-	fmt.Printf("Published job: %s\n", job.ID)
+	elapsed := time.Since(start)
+	fmt.Printf("Published %d jobs in %v (%.1f jobs/sec)\n", count, elapsed, float64(count)/elapsed.Seconds())
 }
 
 func connectRabbitMQ(url string, maxAttempts int) (*amqp.Connection, error) {

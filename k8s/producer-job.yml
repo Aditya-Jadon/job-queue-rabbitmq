@@ -10,5 +10,8 @@ spec:
         - name: producer
           image: job-queue-producer:latest
           imagePullPolicy: Never
+          env:
+            - name: JOB_COUNT
+              value: "300"
       restartPolicy: Never
   backoffLimit: 2
