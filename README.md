@@ -45,7 +45,21 @@ recordCompletion(ctx, job.IdempotencyKey, job.ID)
 msg.Ack(false)
 ```
 
-This closes the silent-data-loss gap. It reopens a much smaller, much rarer race (two workers processing the exact same redelivered message truly simultaneously) — a well-understood, deliberate tradeoff: rare double-execution is acceptable; guaranteed silent job loss is not.
+This closes the silent-data-loss gap, but the original two-step version (separate read-then-write calls) still left a much smaller, much rarer race: two workers processing the exact same redelivered message truly simultaneously could both pass the check before either recorded completion.
+
+**Follow-up fix: an atomic claim-with-lease pattern.** The two-step check-then-record logic was replaced with a single atomic SQL statement — an `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE <claim is stale>` — that claims a job, detects a legitimate in-progress duplicate, and detects (and safely reclaims) a stale claim left behind by a crashed worker, all in one round trip:
+
+```sql
+INSERT INTO job_claims (idempotency_key, job_id, status, claimed_at)
+VALUES ($1, $2, 'in_progress', NOW())
+ON CONFLICT (idempotency_key) DO UPDATE
+    SET job_id = EXCLUDED.job_id, claimed_at = NOW()
+    WHERE job_claims.status = 'in_progress'
+      AND job_claims.claimed_at < NOW() - $3::interval
+RETURNING status
+```
+
+Verified end-to-end: a worker killed mid-job leaves its claim in place; other workers correctly **defer** rather than race to steal it, for as long as the claim could still be legitimate (a configurable staleness window, 90s in this build); once that window passes, exactly one worker reclaims and completes the job. Confirmed live — 9 deferral cycles (10s apart, via the same retry-queue TTL mechanism used for job failures) followed by a successful reclaim and completion.
 
 **Re-running the exact same chaos test after the fix:**
 
@@ -128,8 +142,19 @@ kubectl apply -f k8s/producer-job.yaml -n job-queue
 kubectl logs -l app=worker -n job-queue --prefix
 ```
 
+## Load testing
+
+A 300-job batch was published to the queue and processed across the 3 worker replicas in Kubernetes:
+
+| | Result |
+|---|---|
+| Publish throughput | 4,273 jobs/sec |
+| Jobs processed | 300 / 300 (zero loss, zero duplication) |
+| End-to-end processing time | 0.556 sec |
+| Processing throughput (3 workers) | ~540 jobs/sec |
+
+Verified via the `job_claims` table directly (one row per job, all `completed`), not just log counts — an earlier measurement attempt initially looked like it had processed jobs twice (602 completions logged), which turned out to be two separate test runs accumulating in the same table rather than a real bug; truncating the table before a clean single run resolved the ambiguity and confirmed the system behaves correctly.
+
 ## What's next
 
-- Load-test the queue under sustained concurrent publishing (similar to the `hey`-based tests on other projects in this portfolio), to see how retry/backoff behaves under real throughput, not just single-job chaos tests
-- Resolve the small residual double-execution race with a single atomic Postgres transaction (claim + process + commit) instead of two separate calls
 - Feed this project's structured logs into a log aggregation platform — the natural next step in this portfolio
