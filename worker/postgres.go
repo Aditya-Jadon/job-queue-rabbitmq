@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,16 +28,24 @@ func connectPostgres() {
 	fmt.Println("Postgres connected")
 }
 
-// tryClaimIdempotencyKey attempts to record this idempotency key as
-// processed. Returns true if this is the first time we've seen it
-// (i.e., safe to do real work), false if it's already been processed.
-func tryClaimIdempotencyKey(ctx context.Context, key string, jobID string) (bool, error) {
-	_, err := db.Exec(ctx,
-		"INSERT INTO processed_jobs (idempotency_key, job_id) VALUES ($1, $2)",
-		key, jobID,
-	)
+// tryClaim atomically claims a job. Returns true if this call now owns
+// the job and should process it. Returns false if it's already
+// completed, or legitimately owned by another worker that hasn't gone
+// stale yet.
+func tryClaim(ctx context.Context, key, jobID string, staleAfter time.Duration) (bool, error) {
+	var status string
+	err := db.QueryRow(ctx, `
+		INSERT INTO job_claims (idempotency_key, job_id, status, claimed_at)
+		VALUES ($1, $2, 'in_progress', NOW())
+		ON CONFLICT (idempotency_key) DO UPDATE
+			SET job_id = EXCLUDED.job_id, claimed_at = NOW()
+			WHERE job_claims.status = 'in_progress'
+			  AND job_claims.claimed_at < NOW() - $3::interval
+		RETURNING status
+	`, key, jobID, fmt.Sprintf("%d seconds", int(staleAfter.Seconds()))).Scan(&status)
+
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
@@ -44,27 +53,16 @@ func tryClaimIdempotencyKey(ctx context.Context, key string, jobID string) (bool
 	return true, nil
 }
 
-func isDuplicateKeyError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code == "23505" // unique_violation
-	}
-	return false
-}
-
-func isAlreadyProcessed(ctx context.Context, key string) (bool, error) {
-	var exists bool
-	err := db.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM processed_jobs WHERE idempotency_key = $1)",
-		key,
-	).Scan(&exists)
-	return exists, err
-}
-
-func recordCompletion(ctx context.Context, key string, jobID string) error {
+func markCompleted(ctx context.Context, key string) error {
 	_, err := db.Exec(ctx,
-		"INSERT INTO processed_jobs (idempotency_key, job_id) VALUES ($1, $2) ON CONFLICT (idempotency_key) DO NOTHING",
-		key, jobID,
+		"UPDATE job_claims SET status = 'completed', completed_at = NOW() WHERE idempotency_key = $1",
+		key,
 	)
 	return err
+}
+
+func getClaimStatus(ctx context.Context, key string) (string, error) {
+	var status string
+	err := db.QueryRow(ctx, "SELECT status FROM job_claims WHERE idempotency_key = $1", key).Scan(&status)
+	return status, err
 }

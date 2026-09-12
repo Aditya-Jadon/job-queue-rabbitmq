@@ -12,6 +12,7 @@ import (
 
 const maxRetries = 3
 const retryDelayMs = 10000
+const staleClaimAfter = 90 * time.Second
 
 func main() {
 	connectPostgres()
@@ -52,18 +53,12 @@ func main() {
 		log.Fatalf("Failed to set QoS: %v", err)
 	}
 
-	msgs, err := ch.Consume(
-		jobsQ.Name,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
+	msgs, err := ch.Consume(jobsQ.Name, "", false, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("Failed to register consumer: %v", err)
 	}
+
+	fmt.Println("Worker started. Waiting for jobs...")
 
 	for msg := range msgs {
 		var job Job
@@ -73,28 +68,30 @@ func main() {
 			continue
 		}
 
-		// Quick, cheap pre-check: if we've already recorded this key as
-		// done, skip without even attempting the work again. This is
-		// safe to check early — we're not writing here, just reading.
-		alreadyDone, checkErr := isAlreadyProcessed(context.Background(), job.IdempotencyKey)
-		if checkErr != nil {
-			log.Printf("Failed to check idempotency key for job %s: %v", job.ID, checkErr)
-			body, _ := json.Marshal(job)
-			ch.Publish("", "jobs.retry", false, false, amqp.Publishing{
-				ContentType: "application/json", Body: body, DeliveryMode: amqp.Persistent,
-			})
+		owned, claimErr := tryClaim(context.Background(), job.IdempotencyKey, job.ID, staleClaimAfter)
+		if claimErr != nil {
+			log.Printf("Claim check failed for job %s: %v", job.ID, claimErr)
+			requeueViaRetryQueue(ch, job)
 			msg.Ack(false)
 			continue
 		}
-		if alreadyDone {
-			fmt.Printf("Job %s (key=%s) already completed, skipping\n", job.ID, job.IdempotencyKey)
+
+		if !owned {
+			status, _ := getClaimStatus(context.Background(), job.IdempotencyKey)
+			if status == "completed" {
+				fmt.Printf("Job %s already completed, skipping\n", job.ID)
+				msg.Ack(false)
+				continue
+			}
+			fmt.Printf("Job %s currently owned by another worker, deferring\n", job.ID)
+			requeueViaRetryQueue(ch, job)
 			msg.Ack(false)
 			continue
 		}
 
 		fmt.Printf("Processing job %s (attempt %d): %s\n", job.ID, job.RetryCount+1, job.Payload)
 
-		err := processJob(job)
+		err = processJob(job)
 		if err != nil {
 			job.RetryCount++
 			log.Printf("Job %s failed (attempt %d): %v", job.ID, job.RetryCount, err)
@@ -106,24 +103,35 @@ func main() {
 			}
 
 			body, _ := json.Marshal(job)
-			ch.Publish("", targetQueue, false, false, amqp.Publishing{
-				ContentType: "application/json", Body: body, DeliveryMode: amqp.Persistent,
+			pubErr := ch.Publish("", targetQueue, false, false, amqp.Publishing{
+				ContentType:  "application/json",
+				Body:         body,
+				DeliveryMode: amqp.Persistent,
 			})
+			if pubErr != nil {
+				log.Printf("Failed to route job %s: %v", job.ID, pubErr)
+			}
+
 			msg.Ack(false)
 			continue
 		}
 
-		// Only record the idempotency key AFTER real work has genuinely
-		// succeeded — this is the fix. Claiming it earlier meant a crash
-		// mid-processing left the job permanently, silently marked done
-		// without ever actually finishing.
-		if claimErr := recordCompletion(context.Background(), job.IdempotencyKey, job.ID); claimErr != nil {
-			log.Printf("Warning: failed to record completion for job %s: %v", job.ID, claimErr)
+		if err := markCompleted(context.Background(), job.IdempotencyKey); err != nil {
+			log.Printf("Warning: failed to mark job %s completed: %v", job.ID, err)
 		}
 
 		msg.Ack(false)
 		fmt.Printf("Completed job %s\n", job.ID)
 	}
+}
+
+func requeueViaRetryQueue(ch *amqp.Channel, job Job) {
+	body, _ := json.Marshal(job)
+	ch.Publish("", "jobs.retry", false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+	})
 }
 
 func processJob(job Job) error {
